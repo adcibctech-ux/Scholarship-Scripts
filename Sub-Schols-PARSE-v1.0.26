@@ -1,0 +1,153 @@
+/***** CONFIG: Update only if your field/table names differ *****/
+const SUBMITTED_TABLE = "Submitted Scholarships";
+const AWARDED_TABLE   = "Scholarships Awarded";
+
+// Link back field on "Scholarships Awarded" to the submission
+const F_SOURCE_SUBMISSION = "Source Submission";
+
+// Shared fields carried from submission -> awarded
+const F_REG_FINALS            = "REG_FINALS";               // single select ("REGIONALS" | "FINALS")
+const F_FINALS_ENTRYID        = "Finals EntryID";           // link to "Finals Roster"
+const F_REGIONALS_ENTRYID     = "Regionals EntryID";        // link to "Regionals Roster"
+const F_AWARDING_INSTITUTION  = "Awarding Institution";     // link to "Awarding Institutions"
+const F_AWARDED_BY            = "Awarded By";               // single line text
+const F_OFFER_MATERIALS       = "Offer Materials";          // attachments
+const F_NOTES                 = "Notes from Awarder";       // long text
+
+// Offer block destination fields on "Scholarships Awarded"
+const D_OFFER_TYPE            = "Offer Type";               // single select
+const D_ASSISTANCE            = "Assistance Offered";       // single select
+const D_TUITION               = "Tuition Assist Offer";     // percent
+const D_RNB                   = "R&B Assist Offer";         // percent
+
+// Offer block source field base names (on "Submitted Scholarships")
+const S_OFFER_TYPE_BASE       = "Offer Type-";
+const S_ASSISTANCE_BASE       = "Assistance Offered-";
+const S_TUITION_BASE          = "Tuition Assist Offer-";
+const S_RNB_BASE              = "R&B Assist Offer-";
+
+// How many possible offer blocks exist per submission
+const MAX_OFFERS = 4;
+
+// Source-of-truth count field
+const F_NUMBER_OF_OFFERS = "Number of Offers"; // single select: "ONE" | "TWO" | "THREE" | "FOUR"
+
+/***** HELPERS *****/
+const nameToCount = (name) => {
+  if (!name) return 0;
+  const map = { "ONE": 1, "TWO": 2, "THREE": 3, "FOUR": 4 };
+  return map[name.toUpperCase()] ?? 0;
+};
+
+const ssVal = (cell) => cell ? { name: cell.name } : undefined; // single-select writer
+
+const linkIdsFrom = (cell) => Array.isArray(cell) ? cell.map(x => ({ id: x.id })) : undefined;
+
+const hasAnyOfferData = (rec, i) => {
+  const ot  = rec.getCellValue(`${S_OFFER_TYPE_BASE}${i}`);
+  const ao  = rec.getCellValue(`${S_ASSISTANCE_BASE}${i}`);
+  const tut = rec.getCellValue(`${S_TUITION_BASE}${i}`);
+  const rnb = rec.getCellValue(`${S_RNB_BASE}${i}`);
+  return Boolean(ot || ao || tut || rnb);
+};
+
+/***** MAIN *****/
+const { recordId } = input.config();
+if (!recordId) {
+  throw new Error("Missing input variable 'recordId'. Set it in the automation and map to the triggering record ID.");
+}
+
+const submittedTbl = base.getTable(SUBMITTED_TABLE);
+const awardedTbl   = base.getTable(AWARDED_TABLE);
+
+// Load the submitted record
+const submittedRec = await submittedTbl.selectRecordAsync(recordId);
+if (!submittedRec) {
+  throw new Error(`Could not load Submitted Scholarships record: ${recordId}`);
+}
+
+// Duplicate guard: if any Awarded records already link back to this submission, skip to avoid double-creation
+// (Remove this block if you prefer partial top-up behavior.)
+{
+  const awardedQuery = await awardedTbl.selectRecordsAsync({ fields: [F_SOURCE_SUBMISSION] });
+  const alreadyLinked = awardedQuery.records.some(r => {
+    const links = r.getCellValue(F_SOURCE_SUBMISSION);
+    return Array.isArray(links) && links.some(l => l.id === recordId);
+  });
+  if (alreadyLinked) {
+    console.log(`[INFO] Awarded records already exist for submission ${recordId}. Skipping to avoid duplicates.`);
+    return;
+  }
+}
+
+// Read shared fields from submission
+const finalsLink      = submittedRec.getCellValue(F_FINALS_ENTRYID);       // array or null
+const regionalsLink   = submittedRec.getCellValue(F_REGIONALS_ENTRYID);    // array or null
+const regFinalsSS     = submittedRec.getCellValue(F_REG_FINALS);           // single select
+const awardingInst    = submittedRec.getCellValue(F_AWARDING_INSTITUTION); // array or null
+const awardedByText   = submittedRec.getCellValue(F_AWARDED_BY);           // string or null
+const offerMaterials  = submittedRec.getCellValue(F_OFFER_MATERIALS) ?? []; // attachments (array)
+const notesLT         = submittedRec.getCellValue(F_NOTES) ?? "";          // string or null
+
+// Determine intended number of offers from single select
+const numOffersSS     = submittedRec.getCellValue(F_NUMBER_OF_OFFERS);
+const intendedCount   = nameToCount(numOffersSS?.name);
+
+// Build create payloads
+const creates = [];
+for (let i = 1; i <= Math.min(intendedCount, MAX_OFFERS); i++) {
+  // Dummy-proof: ensure there is at least some data in the i-th block
+  if (!hasAnyOfferData(submittedRec, i)) {
+    console.log(`[WARN] Intended to create offer #${i}, but no data found in -${i} fields. Skipping this block.`);
+    continue;
+  }
+
+  const offerTypeSS   = submittedRec.getCellValue(`${S_OFFER_TYPE_BASE}${i}`);      // single select
+  const assistanceSS  = submittedRec.getCellValue(`${S_ASSISTANCE_BASE}${i}`);      // single select
+  const tuitionPct    = submittedRec.getCellValue(`${S_TUITION_BASE}${i}`);         // number (0..1 if % field)
+  const rnbPct        = submittedRec.getCellValue(`${S_RNB_BASE}${i}`);             // number (0..1 if % field)
+
+  const fields = {};
+
+  // Required back-link to submission
+  fields[F_SOURCE_SUBMISSION] = [{ id: recordId }];
+
+  // REG/FINALS single select
+  if (regFinalsSS) fields[F_REG_FINALS] = ssVal(regFinalsSS);
+
+  // Only ONE of these will be present per submission (your guarantee)
+  if (finalsLink && finalsLink.length) {
+    fields[F_FINALS_ENTRYID] = linkIdsFrom(finalsLink);
+  } else if (regionalsLink && regionalsLink.length) {
+    fields[F_REGIONALS_ENTRYID] = linkIdsFrom(regionalsLink);
+  }
+
+  // Awarding Institution (link)
+  if (awardingInst && awardingInst.length) {
+    fields[F_AWARDING_INSTITUTION] = linkIdsFrom(awardingInst);
+  }
+
+  // Text / Attachments / Long text
+  if (awardedByText)    fields[F_AWARDED_BY]   = awardedByText;
+  if (offerMaterials)   fields[F_OFFER_MATERIALS] = offerMaterials;
+  if (typeof notesLT === "string" && notesLT.length) fields[F_NOTES] = notesLT;
+
+  // Offer block mappings
+  if (offerTypeSS)  fields[D_OFFER_TYPE] = ssVal(offerTypeSS);
+  if (assistanceSS) fields[D_ASSISTANCE] = ssVal(assistanceSS);
+  if (typeof tuitionPct === "number") fields[D_TUITION] = tuitionPct;
+  if (typeof rnbPct === "number")     fields[D_RNB]     = rnbPct;
+
+  creates.push({ fields });
+}
+
+// Create records (batch-safe; but max 4 anyway)
+if (creates.length === 0) {
+  console.log(`[INFO] No Awarded records to create for submission ${recordId}. (Either ZERO offers or all intended blocks were empty.)`);
+  return;
+}
+
+while (creates.length) {
+  await awardedTbl.createRecordsAsync(creates.splice(0, 50));
+}
+console.log(`[SUCCESS] Created ${Math.min(intendedCount, MAX_OFFERS)} Awarded record(s) (${creates.length === 0 ? 'done' : 'batched'}).`);
