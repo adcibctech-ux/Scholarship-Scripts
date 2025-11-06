@@ -1,0 +1,192 @@
+/***** CONFIG: Update if your names differ *****/
+const SUBMITTED_TABLE = "Submitted Scholarships";
+const AWARDED_TABLE   = "Scholarships Awarded";
+
+// Back-link on Awarded
+const F_SOURCE_SUBMISSION = "Source Submission";
+
+// Shared fields (submission -> awarded)
+const F_REG_FINALS           = "REG_FINALS";               // single select
+const F_FINALS_ENTRYID       = "Finals EntryID";           // link
+const F_REGIONALS_ENTRYID    = "Regionals EntryID";        // link
+const F_AWARDING_INSTITUTION = "Awarding Institution";     // link
+const F_AWARDED_BY           = "Awarded By";               // single line text
+const F_OFFER_MATERIALS      = "Offer Materials";          // attachments
+const F_NOTES                = "Notes from Awarder";       // long text
+
+// Destination offer fields on "Scholarships Awarded"
+const D_OFFER_TYPE = "Offer Type";                 // single select
+const D_ASSISTANCE = "Assistance Offered";         // single select
+const D_TUITION    = "Tuition Assist Offer";       // percent/number (0..1)
+const D_RNB        = "R&B Assist Offer";           // percent/number (0..1)
+
+// Source offer field bases on "Submitted Scholarships"
+const S_OFFER_TYPE_BASE = "Offer Type-";
+const S_ASSISTANCE_BASE = "Assistance Offered-";
+const S_TUITION_BASE    = "Tuition Assist Offer-";
+const S_RNB_BASE        = "R&B Assist Offer-";
+
+// Offer-count source
+const F_NUMBER_OF_OFFERS = "Number of Offers";     // SINGLE SELECT (ONE/TWO/THREE/FOUR)
+const MAX_OFFERS = 4;
+
+// Per-offer idempotency checkboxes on the submission
+const ADDED_FLAGS = {
+  1: "Award Added-1",
+  2: "Award Added-2",
+  3: "Award Added-3",
+  4: "Award Added-4",
+};
+
+/***** SAFE HELPERS *****/
+// Safe read: never throws if the field is missing. Returns null if missing.
+function safeGet(rec, fieldName) {
+  try { return rec.getCellValue(fieldName); }
+  catch (e) {
+    console.log(`[WARN] Missing field "${fieldName}" on record ${rec.id}. Treating as null.`);
+    return null;
+  }
+}
+
+// Single select writer from read cell
+const ssVal = (cell) => (cell && cell.name) ? { name: cell.name } : undefined;
+
+// Link value writer from read cell (array of linked recs)
+const linkIdsFrom = (cell) => (Array.isArray(cell) && cell.length)
+  ? cell.map(x => ({ id: x.id }))
+  : undefined;
+
+// Offer count from "ONE/TWO/THREE/FOUR"
+function nameToCount(name) {
+  const n = String(name || "").toUpperCase();
+  return ({ ONE:1, TWO:2, THREE:3, FOUR:4 })[n] || 0;
+}
+
+// Normalize percent input: accepts numbers (0..1 or 0..100) and strings like "50%", "50", "0.5"
+function toPct(val) {
+  if (val === null || val === undefined) return undefined;
+  if (typeof val === "number") {
+    // If someone typed 50 into a number field (misconfigured), treat >1 as %
+    return val > 1 ? val / 100 : val;
+  }
+  if (typeof val === "string") {
+    let s = val.trim();
+    if (!s) return undefined;
+    if (s.endsWith("%")) s = s.slice(0, -1).trim();
+    const n = parseFloat(s);
+    if (isNaN(n)) return undefined;
+    return n > 1 ? n / 100 : n;
+  }
+  return undefined;
+}
+
+// Is there any data in this offer block? (tolerates missing fields and string values)
+function hasAnyOfferData(rec, i) {
+  const ot  = safeGet(rec, `${S_OFFER_TYPE_BASE}${i}`);
+  const ao  = safeGet(rec, `${S_ASSISTANCE_BASE}${i}`);
+  const tut = safeGet(rec, `${S_TUITION_BASE}${i}`);
+  const rnb = safeGet(rec, `${S_RNB_BASE}${i}`);
+  const hasPct = (v) => (typeof v === "number") || (typeof v === "string" && v.trim() !== "");
+  return Boolean(ot || ao || hasPct(tut) || hasPct(rnb));
+}
+
+/***** MAIN *****/
+const { recordId } = input.config();
+if (!recordId) throw new Error("Missing input variable 'recordId' (map it to the triggering record's ID).");
+
+const submittedTbl = base.getTable(SUBMITTED_TABLE);
+const awardedTbl   = base.getTable(AWARDED_TABLE);
+
+// Load the submission record
+const rec = await submittedTbl.selectRecordAsync(recordId);
+if (!rec) throw new Error(`Could not load Submitted Scholarships record: ${recordId}`);
+
+// Shared fields (safe reads)
+const finalsLink     = safeGet(rec, F_FINALS_ENTRYID);
+const regionalsLink  = safeGet(rec, F_REGIONALS_ENTRYID);
+const regFinalsSS    = safeGet(rec, F_REG_FINALS);
+const awardingInst   = safeGet(rec, F_AWARDING_INSTITUTION);
+const awardedByText  = safeGet(rec, F_AWARDED_BY);
+const offerMaterials = safeGet(rec, F_OFFER_MATERIALS) || [];
+const notesLT        = safeGet(rec, F_NOTES) || "";
+
+// How many offers are intended?
+const intendedCount  = nameToCount(safeGet(rec, F_NUMBER_OF_OFFERS)?.name);
+
+// Build creates for offer blocks 1..intendedCount, honoring per-offer flags
+const creates = [];
+const flagsToSet = {}; // accumulate { "Award Added-#": true }
+for (let i = 1; i <= Math.min(intendedCount, MAX_OFFERS); i++) {
+  const flagField = ADDED_FLAGS[i];
+  const alreadyAdded = safeGet(rec, flagField) === true;
+  if (alreadyAdded) {
+    console.log(`[INFO] Offer #${i} already added (checkbox is true). Skipping.`);
+    continue;
+  }
+
+  if (!hasAnyOfferData(rec, i)) {
+    console.log(`[WARN] Offer #${i} intended but its fields are empty. Skipping.`);
+    continue;
+  }
+
+  // Read offer block i (safe; may be strings or numbers)
+  const offerTypeSS  = safeGet(rec, `${S_OFFER_TYPE_BASE}${i}`);
+  const assistanceSS = safeGet(rec, `${S_ASSISTANCE_BASE}${i}`);
+  const tuitionRaw   = safeGet(rec, `${S_TUITION_BASE}${i}`);
+  const rnbRaw       = safeGet(rec, `${S_RNB_BASE}${i}`);
+
+  // Normalize percents to 0..1
+  const tuitionPct = toPct(tuitionRaw);
+  const rnbPct     = toPct(rnbRaw);
+
+  // Assemble create payload
+  const fields = {};
+
+  // Back-link to source submission
+  fields[F_SOURCE_SUBMISSION] = [{ id: recordId }];
+
+  // REG/FINALS select
+  if (regFinalsSS) fields[F_REG_FINALS] = ssVal(regFinalsSS);
+
+  // Only one of these should exist, but handle either gracefully
+  const finalsLinksVal    = linkIdsFrom(finalsLink);
+  const regionalsLinksVal = linkIdsFrom(regionalsLink);
+  if (finalsLinksVal)       fields[F_FINALS_ENTRYID]    = finalsLinksVal;
+  if (regionalsLinksVal)    fields[F_REGIONALS_ENTRYID] = regionalsLinksVal;
+
+  // Awarding Institution link
+  const awardingLinkVal = linkIdsFrom(awardingInst);
+  if (awardingLinkVal) fields[F_AWARDING_INSTITUTION] = awardingLinkVal;
+
+  // Text / Attachments / Notes
+  if (typeof awardedByText === "string" && awardedByText.length) fields[F_AWARDED_BY] = awardedByText;
+  if (Array.isArray(offerMaterials) && offerMaterials.length)    fields[F_OFFER_MATERIALS] = offerMaterials;
+  if (typeof notesLT === "string" && notesLT.length)             fields[F_NOTES] = notesLT;
+
+  // Offer specifics
+  if (offerTypeSS)  fields[D_OFFER_TYPE] = ssVal(offerTypeSS);
+  if (assistanceSS) fields[D_ASSISTANCE] = ssVal(assistanceSS);
+  if (tuitionPct !== undefined) fields[D_TUITION] = tuitionPct;  // allow 0%
+  if (rnbPct     !== undefined) fields[D_RNB]     = rnbPct;      // allow 0%
+
+  creates.push({ fields });
+  // Mark this flag to set after successful creation
+  flagsToSet[flagField] = true;
+}
+
+if (creates.length === 0) {
+  console.log(`[INFO] No Awarded records to create for submission ${recordId}.`);
+  return;
+}
+
+// Create awarded records (<=4 anyway)
+while (creates.length) {
+  await awardedTbl.createRecordsAsync(creates.splice(0, 50));
+}
+
+// Flip the {Award Added-#} checkboxes for the blocks we created
+if (Object.keys(flagsToSet).length) {
+  await submittedTbl.updateRecordAsync(recordId, flagsToSet);
+}
+
+console.log(`[SUCCESS] Created awarded records and updated flags on submission ${recordId}.`);
